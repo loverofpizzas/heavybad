@@ -1,6 +1,6 @@
 # heavybad
 
-**heavybad.py v1.0.0** — Multi-pass bad-sector detector for Linux raw block devices.
+**heavybad.py v1.0.1** — Multi-pass bad-sector detector for Linux raw block devices.
 
 Scans drives at the LBA level using O_DIRECT reads and write/verify passes to find and map bad or slow sectors. Designed for use on unallocated or expendable regions. Requires root.
 
@@ -18,6 +18,7 @@ Scans drives at the LBA level using O_DIRECT reads and write/verify passes to fi
 - **Temperature monitoring** — polls drive temperature via `smartctl` every 30 seconds, displayed in the progress line
 - **Response time histogram** — buckets every read into 0–50ms / 50–200ms / 200–500ms / 500ms+ at end of scan
 - **Filesystem-aware output** — `--fs ntfs` writes LBA ranges for ntfsmarkbad, `--fs ext` writes block numbers for e2fsck
+- **Unified List** — combines skip list & output file by appending newly flagged sectors to skip list.
 
 ## Requirements
 
