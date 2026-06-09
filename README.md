@@ -1,6 +1,6 @@
 # heavybad
 
-**heavybad.py v1.0.1** — Multi-pass bad-sector detector for Linux raw block devices.
+**heavybad.py v1.0.2** — Multi-pass bad-sector detector for Linux raw block devices.
 
 Scans drives at the LBA level using O_DIRECT reads and write/verify passes to find and map bad or slow sectors. Designed for use on unallocated or expendable regions. Requires root.
 
@@ -13,12 +13,13 @@ Scans drives at the LBA level using O_DIRECT reads and write/verify passes to fi
 - **Skip list support** — provide a list of already-known bad LBAs/ranges to skip entirely, saving time on repeat runs
 - **Real-time range output** — bad and slow sectors written to file as `start end` ranges (NTFS) or flat block numbers (ext) as they are found
 - **--merge-skip** — automatically appends new findings to your skip list at the end of each scan
+- **Unified List** — if `--output` and `--skip-list` point to the same file, newly flagged sectors are appended directly onto the skip list, combining both roles into a single file
 - **Queue mode** — run multiple scans back to back from a JSON config, with optional infinite looping and automatic skip list updating between passes
 - **Resume** — saves progress to `heavybad.resume` every 1000 chunks and on Ctrl+C, restoring counts and position on next run
+- **Logging** — `--log FILE` writes a timestamped record of every bad/slow LBA event and a full summary to a file in append mode, accumulating across queue runs
 - **Temperature monitoring** — polls drive temperature via `smartctl` every 30 seconds, displayed in the progress line
 - **Response time histogram** — buckets every read into 0–50ms / 50–200ms / 200–500ms / 500ms+ at end of scan
 - **Filesystem-aware output** — `--fs ntfs` writes LBA ranges for ntfsmarkbad, `--fs ext` writes block numbers for e2fsck
-- **Unified List** — combines skip list & output file by appending newly flagged sectors to skip list.
 
 ## Requirements
 
@@ -64,6 +65,15 @@ sudo python3 heavybad.py \
   --output found_bad.txt \
   --merge-skip --resume --histogram --verbose
 
+# With logging
+sudo python3 heavybad.py \
+  --device /dev/sda \
+  --start-lba 2048 --end-lba 346791935 \
+  --chunk-size 1 --slow-ms 150 --fs ntfs \
+  --skip-list known_bad.txt \
+  --output found_bad.txt \
+  --log scan.log --resume --histogram
+
 # Dry run — validate your command without touching the drive
 sudo python3 heavybad.py \
   --device /dev/sda \
@@ -83,6 +93,8 @@ Create a `queue.json` file to run multiple scans sequentially and unattended. Af
     "device": "/dev/sda",
     "skip_list": "/path/to/known_bad.txt",
     "fs": "ntfs",
+    "resume": true,
+    "log": "/path/to/scan.log",
     "repeat": true,
     "scans": [
         {
@@ -112,6 +124,8 @@ Create a `queue.json` file to run multiple scans sequentially and unattended. Af
 ```
 
 `"repeat": true` loops endlessly until Ctrl+C. `"repeat": 3` loops exactly 3 times.
+
+Top-level keys `resume` and `log` apply to all scans. Both can be overridden per-scan.
 
 If any scan in the queue is destructive, you are asked to confirm **once** at startup — the queue then runs fully unattended.
 
@@ -146,6 +160,7 @@ Single LBAs, space-separated ranges, or dash-separated ranges are all accepted.
 | `--skip-list` | none | File of known-bad LBAs/ranges to skip entirely |
 | `--output` | none | Append all flagged LBAs (bad + slow) in real time |
 | `--slow-output` | none | Also write slow LBAs to a separate file (optional) |
+| `--log` | none | Write timestamped bad/slow events and final summary to FILE (append mode) |
 | `--merge-skip` | off | Append output to skip list after clean scan completes |
 | `--resume` | off | Save/restore progress to `heavybad.resume` |
 | `--histogram` | off | Print response time histogram at end of scan |
