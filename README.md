@@ -2,7 +2,7 @@
 
 **heavybad.py v1.0.2** — Multi-pass bad-sector detector for Linux raw block devices.
 
-Scans drives at the LBA level using O_DIRECT reads and write/verify passes to find and map bad or slow sectors. Designed for use on unallocated or expendable regions. Requires root.
+Scans drives at the LBA level using O_DIRECT reads and write/verify passes to find and map bad or slow sectors. Supports skip lists to avoid re-scanning known-bad regions, making repeat passes fast. Designed for use on unallocated or expendable regions. Requires root.
 
 ## Features
 
