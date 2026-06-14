@@ -34,14 +34,14 @@ Scans drives at the LBA level using O_DIRECT reads and write/verify passes to fi
 
 1. Read-only pass (`--chunk-size 1`) to map all bad/slow sectors at 512B granularity
 2. Inject output into `$BadClus` via [ntfsmarkbad](https://github.com/jamersonpro/ntfsmarkbad)
-3. Destructive pass (`--chunk-size 4096`, 5 passes, 3 verify reads) to stress-test remaining sectors
+3. Destructive pass (`--chunk-size 4096`, 5 passes, 4 rand passes, 3 verify reads) to stress-test remaining sectors
 4. Repeat until no new bad sectors are found
 
 ### ext2/3/4
 
 1. Read-only pass (`--chunk-size 1`) to map all bad/slow sectors at 512B granularity
 2. Inject output into the bad blocks inode via `e2fsck -l bad.txt /dev/sdXN`
-3. Destructive pass (`--chunk-size 4096`, 5 passes, 3 verify reads) to stress-test remaining sectors
+3. Destructive pass (`--chunk-size 4096`, 5 passes, 4 rand passes, 3 verify reads) to stress-test remaining sectors
 4. Repeat until no new bad sectors are found
 
 ## Examples
