@@ -1,10 +1,39 @@
 #!/usr/bin/env python3
 """
-heavybad.py v1.0.2 — Multi-pass bad-sector detector for Linux raw block devices
+heavybad.py v1.0.3 — Multi-pass bad-sector detector for Linux raw block devices
 https://github.com/loverofpizzas/heavybad
 
 Changelog
 ─────────
+v1.0.3
+  Bug Fixes
+    - Queue resume could silently apply to the wrong scan: the resume file was
+      matched only on device/start_lba/end_lba, but a queue's read pass
+      (chunk_size=1) and destructive pass (chunk_size=4096) typically share the
+      same range. A resume file saved mid-destructive-pass would be loaded by
+      the read pass on restart, "resuming" at a chunk offset that — at
+      chunk_size=1 — corresponds to a position essentially at the start of the
+      range, while printing a normal-looking "Resuming from..." message. The
+      read pass would then also clear the resume file on completion, losing the
+      destructive pass's progress entirely.
+      Fixed by also storing chunk_size/destructive in the resume file and
+      requiring all four (device, range, chunk_size, mode) to match before a
+      scan resumes from it. If a resume file belongs to a different scan step,
+      it's left untouched. In queue mode, the matching scan step is detected at
+      startup and earlier (already-completed) scans are skipped on the first loop.
+
+  New: --rand-passes N
+    - Repeats the RAND write pattern N times in a row at the end of each
+      destructive pass (only applies if --passes 5, i.e. RAND is included).
+      RAND is the most effective single pattern at catching marginal sectors
+      that the deterministic 0xAA/0x55/0xFF/0x00 patterns miss; stacking extra
+      RAND passes concentrates additional stress there without affecting the
+      deterministic passes or their per-pattern failure diagnostics.
+    - Supported in queue.json at both top level and per-scan (per-scan takes
+      precedence).
+    - Config header's "Passes" line now shows the full pattern sequence with
+      repeated patterns collapsed, e.g. "0xAA, 0x55, 0xFF, 0x00, RAND ×4".
+
 v1.0.2
   Bug Fixes
     - Progress bar exceeded 100%: Progress.tick() incremented done on every
@@ -60,7 +89,7 @@ import subprocess
 import datetime
 from pathlib import Path
 
-VERSION = "1.0.2"
+VERSION = "1.0.3"
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -74,6 +103,38 @@ WRITE_PATTERNS = [
     (b'\x00', "0x00"),
     (None,    "RAND"),
 ]
+
+def build_pattern_sequence(passes: int, rand_passes: int = 1):
+    """
+    Build the ordered list of (pattern_bytes_or_None, name) write patterns
+    for a destructive scan.
+
+    `passes` selects the first N entries of WRITE_PATTERNS (1-5). If RAND
+    (the 5th/final pattern) is included, `rand_passes` controls how many
+    times it's repeated in a row at the end — extra RAND passes stack the
+    "final net" pattern that's most effective at catching marginal sectors,
+    without affecting the deterministic 0xAA/0x55/0xFF/0x00 passes.
+    """
+    base = list(WRITE_PATTERNS[:passes])
+    if base and base[-1][1] == "RAND" and rand_passes > 1:
+        base += [(None, "RAND")] * (rand_passes - 1)
+    return base
+
+def format_pattern_sequence(patterns) -> str:
+    """Collapse consecutive repeated pattern names for display, e.g.
+    [0xAA, 0x55, 0xFF, 0x00, RAND, RAND, RAND] -> '0xAA, 0x55, 0xFF, 0x00, RAND ×3'"""
+    if not patterns:
+        return ""
+    parts = []
+    i = 0
+    while i < len(patterns):
+        name = patterns[i][1]
+        count = 1
+        while i + count < len(patterns) and patterns[i + count][1] == name:
+            count += 1
+        parts.append(name if count == 1 else f"{name} ×{count}")
+        i += count
+    return ", ".join(parts)
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -295,6 +356,27 @@ def load_resume() -> dict | None:
             return None
     return None
 
+def _resume_match(state: dict | None, device, start_lba, end_lba, chunk_size, destructive) -> str:
+    """
+    Compare a loaded resume state against the scan about to run.
+
+    Returns:
+      'scan'  — state matches this exact scan (range AND chunk_size/mode) — safe to resume
+      'range' — same device/range but a different scan step (e.g. the other
+                pass in a queue) — leave the file alone, it belongs to that scan
+      'none'  — unrelated/stale — safe to discard
+    """
+    if not state:
+        return 'none'
+    same_range = (state.get('device')    == device    and
+                   state.get('start_lba') == start_lba and
+                   state.get('end_lba')   == end_lba)
+    if not same_range:
+        return 'none'
+    same_scan = (state.get('chunk_size')  == chunk_size and
+                  state.get('destructive') == destructive)
+    return 'scan' if same_scan else 'range'
+
 def save_resume(data: dict):
     try:
         with open(RESUME_FILE, 'w') as f:
@@ -351,6 +433,7 @@ def run_queue(queue_file: str):
                 "start_lba":    2048,
                 "end_lba":      346791935,
                 "passes":       5,             // destructive only
+                "rand_passes":  4,             // destructive only, requires passes:5
                 "verify_reads": 3,             // destructive only
                 "retries":      0,
                 "output":       "/path/to/out.txt",
@@ -399,6 +482,27 @@ def run_queue(queue_file: str):
     loop_limit = None if endless else int(repeat)
     loop       = 0
 
+    # If a resume file exists and matches one of this queue's scans (by
+    # device/range/chunk_size/mode), skip the scans before it on the first
+    # loop — they already ran to completion in the prior (interrupted) run.
+    resume_skip_to = 0
+    any_resume = cfg.get('resume', False) or any(s.get('resume', False) for s in scans)
+    if any_resume:
+        _state = load_resume()
+        if _state:
+            for i, sc in enumerate(scans):
+                sc_chunk = sc.get('chunk_size', 8)
+                sc_destr = (sc.get('mode', 'read') == 'destructive')
+                sc_start = sc.get('start_lba', 0)
+                sc_end   = sc.get('end_lba', None)
+                if _resume_match(_state, device, sc_start, sc_end,
+                                  sc_chunk, sc_destr) == 'scan':
+                    resume_skip_to = i
+                    print(f"[+] Resume file matches scan {i+1}/{len(scans)} — "
+                          f"skipping earlier scans in this run (assumed already complete).")
+                    print()
+                    break
+
     print(f"[+] Queue loaded: {len(scans)} scan(s), "
           f"repeat={'endless' if endless else loop_limit}, "
           f"device={device}")
@@ -416,6 +520,12 @@ def run_queue(queue_file: str):
             print()
 
         for scan_idx, scan_cfg in enumerate(scans):
+            if loop == 1 and scan_idx < resume_skip_to:
+                print(f"[+] Scan {scan_idx+1}/{len(scans)} (loop {loop}) — "
+                      f"skipped (already completed before interruption)")
+                print()
+                continue
+
             print(f"[+] Scan {scan_idx+1}/{len(scans)} (loop {loop})")
 
             # Pre-compute unified list mode (output == skip list → same file)
@@ -432,6 +542,7 @@ def run_queue(queue_file: str):
                 sector_size   = scan_cfg.get('sector_size', 512),
                 chunk_size    = scan_cfg.get('chunk_size', 8),
                 passes        = scan_cfg.get('passes', 4),
+                rand_passes   = scan_cfg.get('rand_passes', cfg.get('rand_passes', 1)),
                 verify_reads  = scan_cfg.get('verify_reads', 3),
                 retries       = scan_cfg.get('retries', 0),
                 slow_ms       = scan_cfg.get('slow_ms', 200),
@@ -740,22 +851,31 @@ def scan(args, skip: IntervalSet):
         end_lba   = args.end_lba if args.end_lba is not None else 0
 
     # ── resume logic ──────────────────────────────────────────────────────────
-    resume_chunk    = 0
-    resume_bad_lbas = 0
+    resume_chunk     = 0
+    resume_bad_lbas  = 0
     resume_slow_lbas = 0
+    resume_owned     = True   # may this scan write/clear the resume file?
     if args.resume and not args.dry_run:
         state = load_resume()
-        if state:
-            if (state.get('device') == args.device and
-                state.get('start_lba') == start_lba and
-                state.get('end_lba') == end_lba):
-                resume_chunk     = state.get('chunk_idx', 0)
-                resume_bad_lbas  = state.get('bad_lbas',  0)
-                resume_slow_lbas = state.get('slow_lbas', 0)
-                resumed_lba      = start_lba + resume_chunk * chunk_lbas
-                print(f"[+] Resuming from chunk {resume_chunk:,}  (LBA {resumed_lba:,})  "
-                      f"bad so far: {resume_bad_lbas:,}  slow so far: {resume_slow_lbas:,}")
-            else:
+        match = _resume_match(state, args.device, start_lba, end_lba,
+                               args.chunk_size, args.destructive)
+        if match == 'scan':
+            resume_chunk     = state.get('chunk_idx', 0)
+            resume_bad_lbas  = state.get('bad_lbas',  0)
+            resume_slow_lbas = state.get('slow_lbas', 0)
+            resumed_lba      = start_lba + resume_chunk * chunk_lbas
+            print(f"[+] Resuming from chunk {resume_chunk:,}  (LBA {resumed_lba:,})  "
+                  f"bad so far: {resume_bad_lbas:,}  slow so far: {resume_slow_lbas:,}")
+        elif match == 'range':
+            # Resume file belongs to a different scan step sharing this
+            # device/range (e.g. the other pass in a queue). Leave it intact
+            # for that scan — don't touch or overwrite it from here.
+            resume_owned = False
+            print("[i] Resume file exists for a different scan step "
+                  "(chunk size/mode mismatch) — leaving it untouched, "
+                  "starting this scan fresh.")
+        else:
+            if state:
                 print("[!] Resume file is for a different range — starting fresh.")
                 clear_resume()
 
@@ -764,7 +884,7 @@ def scan(args, skip: IntervalSet):
 
     patterns = [
         (pat * chunk_bytes if pat is not None else None, name)
-        for pat, name in WRITE_PATTERNS[: args.passes]
+        for pat, name in build_pattern_sequence(args.passes, getattr(args, 'rand_passes', 1))
     ] if args.destructive else []
 
     # ── unified list mode — output and skip list are the same file ───────────
@@ -787,7 +907,7 @@ def scan(args, skip: IntervalSet):
     print(f"  Mode         : {'*** DESTRUCTIVE write/verify ***' if args.destructive else 'READ-ONLY probe'}")
     print(f"  Filesystem   : {fs.upper()}  ({'LBA ranges → ntfsmarkbad' if fs == 'ntfs' else 'block numbers → e2fsck -l'})")
     if args.destructive:
-        print(f"  Passes       : {args.passes}  [{', '.join(n for _,n in patterns)}]")
+        print(f"  Passes       : {len(patterns)}  [{format_pattern_sequence(patterns)}]")
         print(f"  Verify reads : {args.verify_reads}x per write  (O_DIRECT)")
     print(f"  Retries      : {args.retries} per sub-range")
     print(f"  Slow ms      : >{args.slow_ms} ms")
@@ -795,7 +915,10 @@ def scan(args, skip: IntervalSet):
     print(f"  Slow output  : {args.slow_output or '(merged into --output)' if args.output else '(none)'}")
     print(f"  Log          : {getattr(args, 'log', None) or '(none)'}")
     print(f"  Merge skip   : {'unified list' if unified else ('yes → ' + str(args.skip_list) if getattr(args, 'merge_skip', False) else 'no')}")
-    print(f"  Resume       : {'enabled → ' + str(RESUME_FILE) if args.resume else 'disabled'}")
+    if args.resume and not resume_owned:
+        print(f"  Resume       : enabled → {RESUME_FILE}  (owned by another scan step)")
+    else:
+        print(f"  Resume       : {'enabled → ' + str(RESUME_FILE) if args.resume else 'disabled'}")
     print(f"  Histogram    : {'enabled' if args.histogram else 'disabled'}")
     print(f"  Dry run      : {'YES — no I/O will occur' if args.dry_run else 'no'}")
     if resume_chunk:
@@ -843,21 +966,26 @@ def scan(args, skip: IntervalSet):
 
     def _save_resume_state():
         save_resume({
-            'device':    args.device,
-            'start_lba': start_lba,
-            'end_lba':   end_lba,
-            'chunk_idx': cur_chunk[0],
-            'bad_lbas':  prog.bad_lbas,
-            'slow_lbas': prog.slow_lbas,
+            'device':      args.device,
+            'start_lba':   start_lba,
+            'end_lba':     end_lba,
+            'chunk_size':  args.chunk_size,
+            'destructive': args.destructive,
+            'chunk_idx':   cur_chunk[0],
+            'bad_lbas':    prog.bad_lbas,
+            'slow_lbas':   prog.slow_lbas,
         })
 
     def _sigint(sig, frame):
         interrupted[0] = True
         lba = start_lba + cur_chunk[0] * chunk_lbas
         print(f"\n\n[!] Interrupted at chunk {cur_chunk[0]:,}  LBA {lba:,}")
-        if args.resume:
+        if args.resume and resume_owned:
             _save_resume_state()
             print(f"    Resume file saved → {RESUME_FILE}")
+        elif args.resume and not resume_owned:
+            print(f"    (resume file belongs to another scan step — not overwritten; "
+                  f"use --start-lba {lba} to continue this scan manually)")
         else:
             print(f"    (--resume not set — use --start-lba {lba} to continue manually)")
 
@@ -870,7 +998,7 @@ def scan(args, skip: IntervalSet):
         cur_chunk[0] = chunk_idx
 
         # Persist resume state every 1000 chunks
-        if args.resume and chunk_idx % 1000 == 0 and chunk_idx != resume_chunk:
+        if args.resume and resume_owned and chunk_idx % 1000 == 0 and chunk_idx != resume_chunk:
             _save_resume_state()
 
         lba_s = start_lba + chunk_idx * chunk_lbas
@@ -903,7 +1031,7 @@ def scan(args, skip: IntervalSet):
             # ── DESTRUCTIVE ───────────────────────────────────────────────────
             if args.destructive:
                 sr_patterns = []
-                for pat, name in WRITE_PATTERNS[: args.passes]:
+                for pat, name in build_pattern_sequence(args.passes, getattr(args, 'rand_passes', 1)):
                     if pat is None:
                         sr_patterns.append((None, name))
                     else:
@@ -1013,7 +1141,7 @@ def scan(args, skip: IntervalSet):
     os.close(fd_r)
     del buf
     if wbuf: del wbuf
-    if args.resume:
+    if args.resume and resume_owned:
         if not interrupted[0] and not device_gone[0]:
             clear_resume()
             print("[+] Resume file cleared (scan completed cleanly).")
@@ -1092,6 +1220,11 @@ def main():
     ap.add_argument("--passes",       type=int, default=4,
                     choices=range(1, 6), metavar="1-5",
                     help="Write patterns for destructive mode (default: 4). Pass 5 = random.")
+    ap.add_argument("--rand-passes",  type=int, default=1,    metavar="N",
+                    help="Repeat the RAND pattern N times in a row at the end of each "
+                         "destructive pass (default: 1). Only applies if --passes 5 "
+                         "(RAND included). Stacks the most marginal-sector-sensitive "
+                         "pattern without affecting the deterministic 0xAA/0x55/0xFF/0x00 passes.")
     ap.add_argument("--verify-reads", type=int, default=3,    metavar="N",
                     help="O_DIRECT reads per write in destructive mode (default: 3)")
     ap.add_argument("--retries",      type=int, default=0,    metavar="N",
@@ -1127,6 +1260,13 @@ def main():
 
     if args.chunk_size < 1:
         print("[!] --chunk-size must be >= 1", file=sys.stderr); sys.exit(1)
+
+    if args.rand_passes < 1:
+        print("[!] --rand-passes must be >= 1", file=sys.stderr); sys.exit(1)
+
+    if args.rand_passes > 1 and args.passes < 5:
+        print("[!] --rand-passes > 1 has no effect unless --passes 5 (RAND included) — ignoring.")
+        args.rand_passes = 1
 
     if getattr(args, 'merge_skip', False) and not args.skip_list:
         print("[!] --merge-skip requires --skip-list to be set.", file=sys.stderr); sys.exit(1)
