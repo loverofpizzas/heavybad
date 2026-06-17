@@ -1,11 +1,11 @@
 # heavybad
-**heavybad.py v1.0.5** — Multi-pass bad-sector detector for Linux raw block devices.
+**heavybad.py v1.0.6** — Multi-pass bad-sector detector for Linux raw block devices.
 Scans drives at the LBA level using O_DIRECT reads and write/verify passes to find and map bad or slow sectors. Supports skip lists to avoid re-scanning known-bad regions, making repeat passes fast. Designed for use on unallocated or expendable regions. Requires root.
 
 ## Features
 - **Read-only mode** (default) — O_DIRECT probe, safe on live/mounted data
 - **Destructive mode** — up to 5 write patterns (0xAA, 0x55, 0xFF, 0x00, RAND) with configurable verify reads per write
-- **Streaming mode** — write entire range then verify entire range per pass; reveals marginal sectors that only fail under sustained sequential write pressure; ~3× faster than chunk mode
+- **Streaming mode** — write entire range then verify entire range per pass, matching the I/O model of `badblocks -w` / h2testw; reveals marginal sectors that only fail under sustained sequential write pressure; ~3× faster than chunk mode; newly found bad/slow sectors are flushed into the live skip set after each half-pass so subsequent phases skip them automatically
 - **RAND as the final net** — the random pattern catches marginal sectors that uniform patterns miss
 - **--rand-passes** — repeat the RAND pattern N times in a row at the end of a destructive pass for extra stress on marginal sectors, without touching the deterministic 0xAA/0x55/0xFF/0x00 passes
 - **Sub-range splitting** — skips only confirmed bad LBAs within a chunk, not the entire chunk
@@ -14,7 +14,7 @@ Scans drives at the LBA level using O_DIRECT reads and write/verify passes to fi
 - **--merge-skip** — automatically appends new findings to your skip list at the end of each scan
 - **Unified List** — if `--output` and `--skip-list` point to the same file, newly flagged sectors are appended directly onto the skip list, combining both roles into a single file
 - **Queue mode** — run multiple scans back to back from a JSON config, with optional infinite looping and automatic skip list updating between passes
-- **Resume** — saves progress to `heavybad.resume` every 1000 chunks and on Ctrl+C, restoring counts and position on next run. Resume state is matched per scan step (device, range, chunk size, mode, and streaming flag), so a queue with multiple scan types resumes the correct one
+- **Resume** — saves progress to `heavybad.resume` every 1000 chunks and on Ctrl+C, restoring counts and position on next run. Resume state is matched per scan step (device, range, chunk size, mode, and streaming flag), so a queue with multiple scan types resumes the correct one. In streaming mode, bad/slow LBA totals are preserved across phases; skip LBA count resets each phase
 - **Logging** — `--log FILE` writes a timestamped record of every bad/slow LBA event and a full summary to a file in append mode, accumulating across queue runs
 - **Temperature monitoring** — polls drive temperature via `smartctl` every 30 seconds, displayed in the progress line
 - **Response time histogram** — buckets every read into 0–50ms / 50–200ms / 200–500ms / 500ms+ at end of scan
@@ -79,7 +79,7 @@ sudo python3 heavybad.py \
   --output found_bad.txt \
   --merge-skip --resume --histogram --verbose
 
-# Streaming scan — fast marginal sector detection
+# Streaming scan — fast marginal sector detection (same I/O model as h2testw)
 sudo python3 heavybad.py \
   --device /dev/sda --destructive --streaming \
   --start-lba 2048 --end-lba 346791935 \
@@ -169,7 +169,7 @@ Single LBAs, space-separated ranges, or dash-separated ranges are all accepted.
 |---|---|---|
 | `--device` | required | Block device to scan (e.g. `/dev/sda`) |
 | `--destructive` | off | Enable write/verify passes. Without it: read-only probe |
-| `--streaming` | off | Streaming destructive mode: write entire range then verify entire range per pass. Finds marginals that fail under sustained write pressure. ~3× faster than chunk mode. `--verify-reads` is not used. (destructive only) |
+| `--streaming` | off | Streaming destructive mode: write entire range then verify entire range per pass. Matches the I/O model of `badblocks -w` / h2testw — finds marginals that fail under sustained write pressure. ~3× faster than chunk mode. `--verify-reads` is not used. (destructive only) |
 | `--start-lba` | `0` | First LBA to scan |
 | `--end-lba` | last LBA | Last LBA to scan inclusive |
 | `--sector-size` | `512` | Logical sector size in bytes |

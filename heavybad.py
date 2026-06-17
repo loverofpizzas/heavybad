@@ -1,10 +1,25 @@
 #!/usr/bin/env python3
 """
-heavybad.py v1.0.5 — Multi-pass bad-sector detector for Linux raw block devices
+heavybad.py v1.0.6 — Multi-pass bad-sector detector for Linux raw block devices
 https://github.com/loverofpizzas/heavybad
 
 Changelog
 ─────────
+v1.0.6
+  Progress bar:
+    - Shortened field labels (B: / Sl: / Sk:) and M/K suffixes on large numbers
+      to keep the line from wrapping on normal terminal widths.
+    - Speed (MB/s) now reflects actual disk I/O only: skipped LBAs are excluded
+      from the throughput calculation. ETA still uses wall-clock time per chunk
+      (which includes skipping) so it remains accurate.
+  Streaming mode:
+    - skip_lbas resets to 0 at the start of each write or verify phase.
+      bad_lbas and slow_lbas are cumulative and are preserved across phases.
+    - Live skip list update: after every write phase, newly flagged bad and slow
+      sectors are flushed into the in-memory IntervalSet so the following verify
+      phase (and all subsequent passes) skip them automatically. Same flush
+      happens after every verify phase for the next pass's write phase.
+
 v1.0.5
   New: --streaming mode (destructive only)
     - Writes the entire scan range with one pattern, issues a single fdatasync,
@@ -118,7 +133,7 @@ import subprocess
 import datetime
 from pathlib import Path
 
-VERSION = "1.0.5"
+VERSION = "1.0.6"
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -758,6 +773,13 @@ def _fmt_eta(seconds: float) -> str:
     return f"{h:02d}:{m:02d}:{s:02d}"
 
 
+def _fmt_lbas(n: int) -> str:
+    """Compact LBA count for progress display: 1,234,567 → 1.2M."""
+    if n >= 1_000_000: return f"{n / 1_000_000:.1f}M"
+    if n >= 1_000:     return f"{n / 1_000:.1f}K"
+    return str(n)
+
+
 class Progress:
     def __init__(self, total_chunks: int, chunk_lbas: int, chunk_bytes: int,
                  resume_bad: int = 0, resume_slow: int = 0,
@@ -784,11 +806,14 @@ class Progress:
         self._last  = 0.0   # force immediate redraw
 
     def reset(self, total_chunks: int):
-        """Reset for the next write/verify phase (streaming mode)."""
-        self.total  = total_chunks
-        self.done   = 0
-        self.t0     = time.monotonic()
-        self._last  = 0.0
+        """Reset for the next write/verify phase (streaming mode).
+        skip_lbas resets to 0 (per-phase counter).
+        bad_lbas/slow_lbas are preserved (cumulative scan results)."""
+        self.total      = total_chunks
+        self.done       = 0
+        self.skip_lbas  = 0
+        self.t0         = time.monotonic()
+        self._last      = 0.0
 
     def tick(self, bad: int = 0, slow: int = 0, skipped: int = 0):
         if bad:
@@ -815,12 +840,18 @@ class Progress:
     def _draw(self):
         pct     = self.done / self.total * 100 if self.total else 0
         elapsed = time.monotonic() - self.t0 or 1e-9
-        rate_bs = self.done * self.chunk_bytes / elapsed
-        rate_mb = rate_bs / (1 << 20)
-        eta_s   = (self.total - self.done) * self.chunk_bytes / rate_bs if rate_bs > 0 else 0
-        eta     = _fmt_eta(eta_s)
         temp    = f"  {self._temp.get()}" if self._temp else ""
         label   = f"[{self._label}] " if self._label else ""
+
+        # ETA: wall-clock rate (includes skipping — gives accurate finish time)
+        wall_rate = self.done * self.chunk_bytes / elapsed
+        eta_s     = (self.total - self.done) * self.chunk_bytes / wall_rate if wall_rate > 0 else 0
+        eta       = _fmt_eta(eta_s)
+
+        # MB/s: actual disk I/O only (skipped LBAs excluded)
+        sector_sz = self.chunk_bytes // self.chunk_lbas if self.chunk_lbas else 512
+        io_lbas   = max(0, self.done * self.chunk_lbas - self.skip_lbas)
+        rate_mb   = io_lbas * sector_sz / elapsed / (1 << 20)
 
         W = 20; f = int(W * pct / 100)
         bar = '█' * f + '░' * (W - f)
@@ -828,9 +859,9 @@ class Progress:
         sys.stdout.write(
             f"\r{label}[{bar}] {pct:5.1f}%  "
             f"chunk {self.done:,}/{self.total:,}  "
-            f"Bad: {self.bad_lbas:,} LBAs ({self.bad_chunks})  "
-            f"Slow: {self.slow_lbas:,} LBAs ({self.slow_chunks})  "
-            f"Skip: {self.skip_lbas:,} LBAs  "
+            f"B:{_fmt_lbas(self.bad_lbas)}({self.bad_chunks})  "
+            f"Sl:{_fmt_lbas(self.slow_lbas)}({self.slow_chunks})  "
+            f"Sk:{_fmt_lbas(self.skip_lbas)}  "
             f"{rate_mb:5.1f} MB/s  ETA {eta}{temp}  "
         )
         sys.stdout.flush()
@@ -1077,6 +1108,20 @@ def scan(args, skip: IntervalSet):
                           f"({patterns[_stream_pass_start][1]})")
                     print()
 
+        # Flush indices: track how much of new_bad/new_slow has been flushed
+        # into the live skip IntervalSet so subsequent phases skip them.
+        _skip_flush_bad  = 0
+        _skip_flush_slow = 0
+
+        def _flush_to_skip():
+            nonlocal _skip_flush_bad, _skip_flush_slow
+            for sr_s, sr_e in new_bad[_skip_flush_bad:]:
+                skip.add_range(sr_s, sr_e)
+            for sr_s, sr_e in new_slow[_skip_flush_slow:]:
+                skip.add_range(sr_s, sr_e)
+            _skip_flush_bad  = len(new_bad)
+            _skip_flush_slow = len(new_slow)
+
         for pass_idx, (pat_tmpl, pat_name) in enumerate(patterns):
             if pass_idx < _stream_pass_start:
                 continue
@@ -1152,6 +1197,10 @@ def scan(args, skip: IntervalSet):
             print(f"  [sync {pat_name} pass {pass_idx+1}/{len(patterns)}...]", end='', flush=True)
             _fdatasync(fd_w)
             print(" done")
+
+            # Flush write-phase bad/slow into live skip set so verify phase
+            # (and all following passes) don't re-visit them.
+            _flush_to_skip()
             print()
 
             # ── VERIFY PHASE ───────────────────────────────────────────────────
@@ -1239,6 +1288,11 @@ def scan(args, skip: IntervalSet):
                         prog.tick()
 
                 prog.advance()
+
+        # Flush verify-phase bad/slow into live skip set so the next
+        # pattern pass's write phase skips them from the start.
+        if not (interrupted[0] or device_gone[0]):
+            _flush_to_skip()
 
     # ── CHUNK mode (default) ─────────────────────────────────────────────────
     # When _streaming is True the range evaluates to range(N, N) = empty,
