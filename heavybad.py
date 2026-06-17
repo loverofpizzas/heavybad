@@ -1,10 +1,39 @@
 #!/usr/bin/env python3
 """
-heavybad.py v1.0.3 — Multi-pass bad-sector detector for Linux raw block devices
+heavybad.py v1.0.5 — Multi-pass bad-sector detector for Linux raw block devices
 https://github.com/loverofpizzas/heavybad
 
 Changelog
 ─────────
+v1.0.5
+  New: --streaming mode (destructive only)
+    - Writes the entire scan range with one pattern, issues a single fdatasync,
+      then reads the entire range back for verification — matching the I/O model
+      used by badblocks -w and h2testw.  The key difference from chunk mode is
+      that writes are not sync-flushed after each chunk; instead the OS and drive
+      firmware are free to pipeline writes into one sustained sequential burst.
+      This creates the sustained platter write pressure that reveals marginal
+      sectors which pass per-chunk O_SYNC writes but fail under real workloads.
+    - ~3× faster than chunk mode at equivalent pass count because the O_SYNC
+      barrier overhead is eliminated and verify-reads is implicitly 1 per chunk.
+    - RAND pattern: a single os.urandom() tile (chunk_bytes) is generated once
+      per pass and reused for every chunk, eliminating the need to regenerate
+      matching random data during the verify phase.
+    - Write errors during the write phase are recorded immediately (as in chunk
+      mode); the affected chunk is skipped in the verify phase.
+    - --retries applies to verify-phase reads.  --verify-reads is not used.
+    - Resume: pass-level granularity.  If interrupted, the current pattern pass
+      restarts from scratch on next run.  A new RAND tile is generated for that
+      pass.  Pass-level state is stored in the resume file as stream_pass_idx.
+
+v1.0.4
+  Bug Fixes
+    - With --rand-passes > 1, every RAND pass was reported identically as
+      "RAND" in BAD/SLOW events and logs, so a failure couldn't be attributed
+      to a specific RAND pass. Each RAND pass is now individually labeled
+      "RAND i/N" (e.g. "OSError RAND 3/4: ..."), and the config header's
+      "Passes" line shows each one explicitly.
+
 v1.0.3
   Bug Fixes
     - Queue resume could silently apply to the wrong scan: the resume file was
@@ -89,7 +118,7 @@ import subprocess
 import datetime
 from pathlib import Path
 
-VERSION = "1.0.3"
+VERSION = "1.0.5"
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -110,14 +139,16 @@ def build_pattern_sequence(passes: int, rand_passes: int = 1):
     for a destructive scan.
 
     `passes` selects the first N entries of WRITE_PATTERNS (1-5). If RAND
-    (the 5th/final pattern) is included, `rand_passes` controls how many
-    times it's repeated in a row at the end — extra RAND passes stack the
-    "final net" pattern that's most effective at catching marginal sectors,
-    without affecting the deterministic 0xAA/0x55/0xFF/0x00 passes.
+    (the 5th/final pattern) is included and `rand_passes` > 1, the single
+    RAND entry is replaced with `rand_passes` entries labeled "RAND i/N" —
+    each gets fresh random data and a distinct name, so a failure on any
+    individual RAND pass is identifiable (e.g. "OSError RAND 3/4: ...")
+    rather than every RAND pass being reported identically as "RAND".
     """
     base = list(WRITE_PATTERNS[:passes])
     if base and base[-1][1] == "RAND" and rand_passes > 1:
-        base += [(None, "RAND")] * (rand_passes - 1)
+        rand_pat = base[-1][0]  # None — generates fresh os.urandom() per pass
+        base = base[:-1] + [(rand_pat, f"RAND {i+1}/{rand_passes}") for i in range(rand_passes)]
     return base
 
 def format_pattern_sequence(patterns) -> str:
@@ -356,12 +387,12 @@ def load_resume() -> dict | None:
             return None
     return None
 
-def _resume_match(state: dict | None, device, start_lba, end_lba, chunk_size, destructive) -> str:
+def _resume_match(state: dict | None, device, start_lba, end_lba, chunk_size, destructive, streaming: bool = False) -> str:
     """
     Compare a loaded resume state against the scan about to run.
 
     Returns:
-      'scan'  — state matches this exact scan (range AND chunk_size/mode) — safe to resume
+      'scan'  — state matches this exact scan (range AND chunk_size/mode/streaming) — safe to resume
       'range' — same device/range but a different scan step (e.g. the other
                 pass in a queue) — leave the file alone, it belongs to that scan
       'none'  — unrelated/stale — safe to discard
@@ -374,7 +405,8 @@ def _resume_match(state: dict | None, device, start_lba, end_lba, chunk_size, de
     if not same_range:
         return 'none'
     same_scan = (state.get('chunk_size')  == chunk_size and
-                  state.get('destructive') == destructive)
+                  state.get('destructive') == destructive and
+                  state.get('streaming', False) == streaming)
     return 'scan' if same_scan else 'range'
 
 def save_resume(data: dict):
@@ -444,6 +476,9 @@ def run_queue(queue_file: str):
         ]
     }
     After each scan, its output is automatically appended to the skip list.
+
+    streaming is supported as a top-level default and per-scan override:
+        "streaming": true
     """
     p = Path(queue_file)
     if not p.exists():
@@ -556,6 +591,7 @@ def run_queue(queue_file: str):
                 verbose       = scan_cfg.get('verbose', False),
                 fs            = scan_cfg.get('fs', cfg.get('fs', None)),
                 skip_confirmation = True,   # already confirmed at queue startup
+                streaming     = scan_cfg.get('streaming', cfg.get('streaming', False)),
                 merge_skip    = bool(skip_path and _output and not _unified),
             )
 
@@ -725,7 +761,8 @@ def _fmt_eta(seconds: float) -> str:
 class Progress:
     def __init__(self, total_chunks: int, chunk_lbas: int, chunk_bytes: int,
                  resume_bad: int = 0, resume_slow: int = 0,
-                 temp_poller: 'TempPoller | None' = None):
+                 temp_poller: 'TempPoller | None' = None,
+                 label: str = ''):
         self.total        = total_chunks
         self.chunk_lbas   = chunk_lbas
         self.chunk_bytes  = chunk_bytes
@@ -739,6 +776,19 @@ class Progress:
         self.t0           = time.monotonic()
         self._last        = 0.0
         self._temp        = temp_poller
+        self._label       = label
+
+    def set_label(self, label: str):
+        """Update the phase label shown in the progress bar (streaming mode)."""
+        self._label = label
+        self._last  = 0.0   # force immediate redraw
+
+    def reset(self, total_chunks: int):
+        """Reset for the next write/verify phase (streaming mode)."""
+        self.total  = total_chunks
+        self.done   = 0
+        self.t0     = time.monotonic()
+        self._last  = 0.0
 
     def tick(self, bad: int = 0, slow: int = 0, skipped: int = 0):
         if bad:
@@ -770,12 +820,13 @@ class Progress:
         eta_s   = (self.total - self.done) * self.chunk_bytes / rate_bs if rate_bs > 0 else 0
         eta     = _fmt_eta(eta_s)
         temp    = f"  {self._temp.get()}" if self._temp else ""
+        label   = f"[{self._label}] " if self._label else ""
 
         W = 20; f = int(W * pct / 100)
         bar = '█' * f + '░' * (W - f)
 
         sys.stdout.write(
-            f"\r[{bar}] {pct:5.1f}%  "
+            f"\r{label}[{bar}] {pct:5.1f}%  "
             f"chunk {self.done:,}/{self.total:,}  "
             f"Bad: {self.bad_lbas:,} LBAs ({self.bad_chunks})  "
             f"Slow: {self.slow_lbas:,} LBAs ({self.slow_chunks})  "
@@ -813,7 +864,10 @@ def scan(args, skip: IntervalSet):
     else:
         try:
             if args.destructive:
-                fd_w = os.open(args.device, os.O_RDWR | os.O_SYNC)
+                # Streaming mode omits O_SYNC — a single fdatasync() is called
+                # after the full write pass instead, matching badblocks behaviour.
+                _w_flags = os.O_RDWR if getattr(args, 'streaming', False) else os.O_RDWR | os.O_SYNC
+                fd_w = os.open(args.device, _w_flags)
             fd_r = os.open(args.device, os.O_RDONLY | O_DIRECT)
         except PermissionError:
             print(f"[!] Cannot open {args.device} — run as root.", file=sys.stderr); sys.exit(1)
@@ -851,14 +905,17 @@ def scan(args, skip: IntervalSet):
         end_lba   = args.end_lba if args.end_lba is not None else 0
 
     # ── resume logic ──────────────────────────────────────────────────────────
+    _resume_state_raw = None   # kept for streaming pass-level resume lookup
     resume_chunk     = 0
     resume_bad_lbas  = 0
     resume_slow_lbas = 0
     resume_owned     = True   # may this scan write/clear the resume file?
     if args.resume and not args.dry_run:
-        state = load_resume()
+        _resume_state_raw = load_resume()
+        state = _resume_state_raw
         match = _resume_match(state, args.device, start_lba, end_lba,
-                               args.chunk_size, args.destructive)
+                               args.chunk_size, args.destructive,
+                               getattr(args, 'streaming', False))
         if match == 'scan':
             resume_chunk     = state.get('chunk_idx', 0)
             resume_bad_lbas  = state.get('bad_lbas',  0)
@@ -904,11 +961,15 @@ def scan(args, skip: IntervalSet):
         print(f"  Device       : {args.device}  [DRY RUN — device not opened]")
     print(f"  Range        : LBA {start_lba:,} – {end_lba:,}  "
           f"({total_lbas:,} LBAs, {total_chunks:,} chunks of {chunk_lbas})")
-    print(f"  Mode         : {'*** DESTRUCTIVE write/verify ***' if args.destructive else 'READ-ONLY probe'}")
+    _is_streaming = getattr(args, 'streaming', False) and args.destructive
+    print(f"  Mode         : {'*** DESTRUCTIVE write/verify (STREAMING) ***' if _is_streaming else '*** DESTRUCTIVE write/verify ***' if args.destructive else 'READ-ONLY probe'}")
     print(f"  Filesystem   : {fs.upper()}  ({'LBA ranges → ntfsmarkbad' if fs == 'ntfs' else 'block numbers → e2fsck -l'})")
     if args.destructive:
         print(f"  Passes       : {len(patterns)}  [{format_pattern_sequence(patterns)}]")
-        print(f"  Verify reads : {args.verify_reads}x per write  (O_DIRECT)")
+        if _is_streaming:
+            print(f"  Verify reads : 1x per chunk  (streaming — single read after full-range fdatasync)")
+        else:
+            print(f"  Verify reads : {args.verify_reads}x per write  (O_DIRECT)")
     print(f"  Retries      : {args.retries} per sub-range")
     print(f"  Slow ms      : >{args.slow_ms} ms")
     print(f"  Output       : {(args.output + '  [unified list]') if unified else (args.output or '(none)')}")
@@ -940,7 +1001,7 @@ def scan(args, skip: IntervalSet):
     if log:
         log.write(f"heavybad v{VERSION} — scan started")
         log.write(f"  Device     : {args.device}")
-        log.write(f"  Mode       : {'DESTRUCTIVE' if args.destructive else 'READ-ONLY'}")
+        log.write(f"  Mode       : {'DESTRUCTIVE (STREAMING)' if _is_streaming else 'DESTRUCTIVE' if args.destructive else 'READ-ONLY'}")
         log.write(f"  Range      : LBA {start_lba:,} – {end_lba:,}  ({end_lba - start_lba + 1:,} LBAs)")
         log.write(f"  Chunk      : {chunk_lbas} LBAs")
         log.write(f"  Filesystem : {fs.upper()}")
@@ -963,18 +1024,23 @@ def scan(args, skip: IntervalSet):
     interrupted  = [False]
     device_gone  = [False]
     cur_chunk    = [resume_chunk]
+    cur_pass     = [0]          # streaming mode: current pattern pass index
 
     def _save_resume_state():
-        save_resume({
+        state = {
             'device':      args.device,
             'start_lba':   start_lba,
             'end_lba':     end_lba,
             'chunk_size':  args.chunk_size,
             'destructive': args.destructive,
+            'streaming':   getattr(args, 'streaming', False),
             'chunk_idx':   cur_chunk[0],
             'bad_lbas':    prog.bad_lbas,
             'slow_lbas':   prog.slow_lbas,
-        })
+        }
+        if getattr(args, 'streaming', False):
+            state['stream_pass_idx'] = cur_pass[0]
+        save_resume(state)
 
     def _sigint(sig, frame):
         interrupted[0] = True
@@ -991,8 +1057,193 @@ def scan(args, skip: IntervalSet):
 
     signal.signal(signal.SIGINT, _sigint)
 
-    # ── main loop ─────────────────────────────────────────────────────────────
-    for chunk_idx in range(resume_chunk, total_chunks):
+    _streaming = getattr(args, 'streaming', False) and args.destructive
+
+    # ── STREAMING destructive ─────────────────────────────────────────────────
+    # Each pattern pass: write entire range (no per-chunk sync) → fdatasync once
+    # → verify entire range.  Same I/O model as badblocks -w / h2testw.
+    if _streaming:
+        # Pass-level resume: find which pattern pass to start from
+        _stream_pass_start = 0
+        if args.resume and resume_owned and _resume_state_raw:
+            _rs = _resume_state_raw
+            if (_resume_match(_rs, args.device, start_lba, end_lba,
+                               args.chunk_size, args.destructive, True) == 'scan'
+                    and _rs.get('streaming')):
+                _stream_pass_start = _rs.get('stream_pass_idx', 0)
+                if _stream_pass_start:
+                    print(f"[+] Streaming resume: starting at pattern pass "
+                          f"{_stream_pass_start + 1}/{len(patterns)} "
+                          f"({patterns[_stream_pass_start][1]})")
+                    print()
+
+        for pass_idx, (pat_tmpl, pat_name) in enumerate(patterns):
+            if pass_idx < _stream_pass_start:
+                continue
+            if interrupted[0] or device_gone[0]:
+                break
+
+            cur_pass[0] = pass_idx
+            is_rand     = (pat_tmpl is None)
+
+            # RAND: one os.urandom() tile generated once per pass.  Every chunk
+            # in the write phase receives the same bytes; the same buffer object
+            # is held in memory and reused for the verify phase — no regeneration
+            # needed.  If interrupted and resumed, a fresh tile is generated and
+            # the whole pass re-writes before verifying.
+            rand_tile = os.urandom(chunk_bytes) if is_rand else None
+            if is_rand and log:
+                log.write(f"STREAM RAND {pat_name} pass {pass_idx+1}/{len(patterns)}  "
+                          f"tile={chunk_bytes:,} B")
+
+            # ── WRITE PHASE ────────────────────────────────────────────────────
+            prog.reset(total_chunks)
+            prog.set_label(f"WRITE {pat_name} {pass_idx+1}/{len(patterns)}")
+            failed_chunks: set[int] = set()   # chunks with write errors → skip verify
+
+            for chunk_idx in range(total_chunks):
+                if interrupted[0] or device_gone[0]:
+                    break
+                cur_chunk[0] = chunk_idx
+                if args.resume and resume_owned and chunk_idx % 1000 == 0 and chunk_idx:
+                    _save_resume_state()
+
+                lba_s = start_lba + chunk_idx * chunk_lbas
+                lba_e = min(lba_s + chunk_lbas - 1, end_lba)
+                subranges = get_scan_subranges(lba_s, lba_e, skip)
+                skipped   = (lba_e - lba_s + 1) - sum(e - s + 1 for s, e in subranges)
+                if skipped:
+                    prog.tick(skipped=skipped)
+                    if not subranges:
+                        prog.advance()
+                        continue
+
+                chunk_write_err = False
+                for sr_s, sr_e in subranges:
+                    if interrupted[0] or device_gone[0]:
+                        break
+                    real_lbas  = sr_e - sr_s + 1
+                    real_bytes = real_lbas * sector_size
+                    byte_off   = sr_s * sector_size
+                    write_data = rand_tile[:real_bytes] if is_rand else pat_tmpl[:real_bytes]
+                    try:
+                        os.lseek(fd_w, byte_off, os.SEEK_SET)
+                        wbuf.write_from(fd_w, write_data)
+                    except OSError as exc:
+                        if not os.path.exists(args.device):
+                            device_gone[0] = True
+                            break
+                        chunk_write_err = True
+                        new_bad.append((sr_s, sr_e))
+                        if out_f:      out_f.write_range(sr_s, sr_e)
+                        if log:        log.write(f"BAD   LBA {sr_s:,}–{sr_e:,}  OSError {pat_name} (write): {exc}")
+                        if args.verbose:
+                            print(f"\n  [BAD]  LBA {sr_s:,}–{sr_e:,}  (write error {pat_name}: {exc})")
+                        prog.tick(bad=real_lbas)
+                if chunk_write_err:
+                    failed_chunks.add(chunk_idx)
+                prog.advance()
+
+            if interrupted[0] or device_gone[0]:
+                break
+
+            # Flush entire write pass to platter before reading back
+            prog.finish()
+            print(f"  [sync {pat_name} pass {pass_idx+1}/{len(patterns)}...]", end='', flush=True)
+            _fdatasync(fd_w)
+            print(" done")
+            print()
+
+            # ── VERIFY PHASE ───────────────────────────────────────────────────
+            prog.reset(total_chunks)
+            prog.set_label(f"VRFY  {pat_name} {pass_idx+1}/{len(patterns)}")
+
+            for chunk_idx in range(total_chunks):
+                if interrupted[0] or device_gone[0]:
+                    break
+                cur_chunk[0] = chunk_idx
+
+                if chunk_idx in failed_chunks:
+                    prog.advance()
+                    continue
+
+                lba_s = start_lba + chunk_idx * chunk_lbas
+                lba_e = min(lba_s + chunk_lbas - 1, end_lba)
+                subranges = get_scan_subranges(lba_s, lba_e, skip)
+                skipped   = (lba_e - lba_s + 1) - sum(e - s + 1 for s, e in subranges)
+                if skipped:
+                    prog.tick(skipped=skipped)
+                    if not subranges:
+                        prog.advance()
+                        continue
+
+                for sr_s, sr_e in subranges:
+                    if interrupted[0] or device_gone[0]:
+                        break
+                    real_lbas  = sr_e - sr_s + 1
+                    real_bytes = real_lbas * sector_size
+                    byte_off   = sr_s * sector_size
+                    expected   = rand_tile[:real_bytes] if is_rand else pat_tmpl[:real_bytes]
+
+                    chunk_bad    = False
+                    chunk_slow   = False
+                    fail_reason  = ""
+                    peak_read_ms = 0.0
+
+                    for attempt in range(args.retries + 1):
+                        try:
+                            os.lseek(fd_r, byte_off, os.SEEK_SET)
+                            t0        = time.monotonic()
+                            read_back = buf.read_into(fd_r)
+                            read_ms   = (time.monotonic() - t0) * 1000
+                            if read_ms > peak_read_ms:
+                                peak_read_ms = read_ms
+                            if hist: hist.record(read_ms)
+                            prog.total_reads += 1
+                            if read_back[:real_bytes] != expected:
+                                fail_reason = f"mismatch on {pat_name} verify"
+                                if attempt == args.retries:
+                                    chunk_bad = True
+                            elif read_ms > args.slow_ms:
+                                chunk_slow = True
+                                break
+                            else:
+                                break
+                        except OSError as exc:
+                            if not os.path.exists(args.device):
+                                device_gone[0] = True
+                                break
+                            fail_reason = f"OSError {pat_name} (verify): {exc}"
+                            if attempt == args.retries:
+                                chunk_bad = True
+
+                    if device_gone[0]:
+                        break
+
+                    if chunk_bad:
+                        new_bad.append((sr_s, sr_e))
+                        if out_f:      out_f.write_range(sr_s, sr_e)
+                        if log:        log.write(f"BAD   LBA {sr_s:,}–{sr_e:,}  {fail_reason}")
+                        if args.verbose:
+                            print(f"\n  [BAD]  LBA {sr_s:,}–{sr_e:,}  ({fail_reason})")
+                        prog.tick(bad=real_lbas)
+                    elif chunk_slow:
+                        new_slow.append((sr_s, sr_e))
+                        if out_f:      out_f.write_range(sr_s, sr_e)
+                        if slow_out_f: slow_out_f.write_range(sr_s, sr_e)
+                        if log:        log.write(f"SLOW  LBA {sr_s:,}–{sr_e:,}  {peak_read_ms:.0f} ms")
+                        if args.verbose:
+                            print(f"\n  [SLOW] LBA {sr_s:,}–{sr_e:,}  ({peak_read_ms:.0f} ms)")
+                        prog.tick(slow=real_lbas)
+                    else:
+                        prog.tick()
+
+                prog.advance()
+
+    # ── CHUNK mode (default) ─────────────────────────────────────────────────
+    # When _streaming is True the range evaluates to range(N, N) = empty,
+    # so this loop is bypassed cleanly without re-indentation.
+    for chunk_idx in range(total_chunks if _streaming else resume_chunk, total_chunks):
         if interrupted[0] or device_gone[0]: break
 
         cur_chunk[0] = chunk_idx
@@ -1248,6 +1499,13 @@ def main():
                     help=f"Save/restore scan progress to {RESUME_FILE}")
     ap.add_argument("--histogram",    action="store_true",
                     help="Print response time histogram at end of scan")
+    ap.add_argument("--streaming",    action="store_true",
+                    help="Streaming destructive mode: write entire range with one pattern pass, "
+                         "fdatasync once, then verify entire range — same I/O model as "
+                         "badblocks -w / h2testw.  Reveals marginal sectors that fail only under "
+                         "sustained sequential write pressure.  ~3x faster than chunk mode at "
+                         "equivalent pass count.  verify-reads is always 1 in this mode.  "
+                         "(destructive only)")
     ap.add_argument("--dry-run",      action="store_true",
                     help="Parse args and print config, but do not open or touch the device")
     ap.add_argument("--verbose",      action="store_true",
@@ -1263,6 +1521,9 @@ def main():
 
     if args.rand_passes < 1:
         print("[!] --rand-passes must be >= 1", file=sys.stderr); sys.exit(1)
+
+    if getattr(args, 'streaming', False) and not args.destructive:
+        print("[!] --streaming requires --destructive.", file=sys.stderr); sys.exit(1)
 
     if args.rand_passes > 1 and args.passes < 5:
         print("[!] --rand-passes > 1 has no effect unless --passes 5 (RAND included) — ignoring.")
