@@ -1,10 +1,37 @@
 #!/usr/bin/env python3
 """
-heavybad.py v1.0.6 — Multi-pass bad-sector detector for Linux raw block devices
+heavybad.py v1.0.7 — Multi-pass bad-sector detector for Linux raw block devices
 https://github.com/loverofpizzas/heavybad
 
 Changelog
 ─────────
+v1.0.7
+  Streaming mode — write-phase timing and slow detection:
+    - fd_w is now opened with O_DIRECT (no O_SYNC) in streaming mode.
+      O_DIRECT forces write() to block until the DMA transfer completes, giving
+      real per-write timing.  NCQ is unaffected so sustained sequential pressure
+      is preserved.
+    - Each chunk is written as a single O_DIRECT call (chunk_bytes, always
+      4096-aligned) starting at the chunk's LBA boundary.  This eliminates
+      sub-range alignment concerns and gives one clean timing measurement per
+      chunk.  Skip-listed sectors within a chunk are written over but not
+      verified, which is intentional on unallocated space.
+    - If the write() call exceeds --slow-ms, all non-skipped sub-ranges in that
+      chunk are recorded as SLOW (with "(write)" in the log).  The verify phase
+      still runs for those chunks so a slow write can be upgraded to BAD if the
+      data did not persist correctly.
+    - Write OSError still flags sub-ranges as BAD and skips the verify phase for
+      that chunk (unchanged from v1.0.6).
+    - RAND verify expected value is now offset-aware: because the full chunk is
+      written as one buffer, each sub-range is compared against its correct slice
+      of rand_tile rather than always slice [0:real_bytes].
+    - Startup check: --streaming requires --chunk-size to be a multiple of 8
+      (i.e. chunk_bytes a multiple of 4096 for O_DIRECT alignment).
+  Live skip flush:
+    - Post-write-phase flush now excludes slow sectors (include_slow=False) so
+      write-slow sub-ranges still reach the verify phase and can be upgraded to
+      BAD.  Post-verify-phase flush includes both bad and slow (unchanged).
+
 v1.0.6
   Progress bar:
     - Shortened field labels (B: / Sl: / Sk:) and M/K suffixes on large numbers
@@ -133,7 +160,7 @@ import subprocess
 import datetime
 from pathlib import Path
 
-VERSION = "1.0.6"
+VERSION = "1.0.7"
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -895,9 +922,11 @@ def scan(args, skip: IntervalSet):
     else:
         try:
             if args.destructive:
-                # Streaming mode omits O_SYNC — a single fdatasync() is called
-                # after the full write pass instead, matching badblocks behaviour.
-                _w_flags = os.O_RDWR if getattr(args, 'streaming', False) else os.O_RDWR | os.O_SYNC
+                # Streaming: O_DIRECT (no O_SYNC) — DMA must complete before
+                # write() returns, giving real per-write timing while NCQ still
+                # pipelines writes for sustained sequential pressure.
+                # Chunk mode: O_SYNC — per-chunk flush as before.
+                _w_flags = (os.O_RDWR | O_DIRECT) if getattr(args, 'streaming', False) else os.O_RDWR | os.O_SYNC
                 fd_w = os.open(args.device, _w_flags)
             fd_r = os.open(args.device, os.O_RDONLY | O_DIRECT)
         except PermissionError:
@@ -1113,14 +1142,15 @@ def scan(args, skip: IntervalSet):
         _skip_flush_bad  = 0
         _skip_flush_slow = 0
 
-        def _flush_to_skip():
+        def _flush_to_skip(include_slow: bool = True):
             nonlocal _skip_flush_bad, _skip_flush_slow
             for sr_s, sr_e in new_bad[_skip_flush_bad:]:
                 skip.add_range(sr_s, sr_e)
-            for sr_s, sr_e in new_slow[_skip_flush_slow:]:
-                skip.add_range(sr_s, sr_e)
-            _skip_flush_bad  = len(new_bad)
-            _skip_flush_slow = len(new_slow)
+            _skip_flush_bad = len(new_bad)
+            if include_slow:
+                for sr_s, sr_e in new_slow[_skip_flush_slow:]:
+                    skip.add_range(sr_s, sr_e)
+                _skip_flush_slow = len(new_slow)
 
         for pass_idx, (pat_tmpl, pat_name) in enumerate(patterns):
             if pass_idx < _stream_pass_start:
@@ -1142,9 +1172,12 @@ def scan(args, skip: IntervalSet):
                           f"tile={chunk_bytes:,} B")
 
             # ── WRITE PHASE ────────────────────────────────────────────────────
+            # One O_DIRECT write() per chunk (chunk_bytes, 4096-aligned) timed
+            # with monotonic clock.  Slow writes flag sub-ranges SLOW but still
+            # reach the verify phase.  OSError flags them BAD and skips verify.
             prog.reset(total_chunks)
             prog.set_label(f"WRITE {pat_name} {pass_idx+1}/{len(patterns)}")
-            failed_chunks: set[int] = set()   # chunks with write errors → skip verify
+            failed_chunks: set[int] = set()   # write-error chunks → skip verify
 
             for chunk_idx in range(total_chunks):
                 if interrupted[0] or device_gone[0]:
@@ -1163,30 +1196,46 @@ def scan(args, skip: IntervalSet):
                         prog.advance()
                         continue
 
-                chunk_write_err = False
-                for sr_s, sr_e in subranges:
-                    if interrupted[0] or device_gone[0]:
-                        break
-                    real_lbas  = sr_e - sr_s + 1
-                    real_bytes = real_lbas * sector_size
-                    byte_off   = sr_s * sector_size
-                    write_data = rand_tile[:real_bytes] if is_rand else pat_tmpl[:real_bytes]
-                    try:
-                        os.lseek(fd_w, byte_off, os.SEEK_SET)
-                        wbuf.write_from(fd_w, write_data)
-                    except OSError as exc:
-                        if not os.path.exists(args.device):
-                            device_gone[0] = True
-                            break
-                        chunk_write_err = True
-                        new_bad.append((sr_s, sr_e))
-                        if out_f:      out_f.write_range(sr_s, sr_e)
-                        if log:        log.write(f"BAD   LBA {sr_s:,}–{sr_e:,}  OSError {pat_name} (write): {exc}")
-                        if args.verbose:
-                            print(f"\n  [BAD]  LBA {sr_s:,}–{sr_e:,}  (write error {pat_name}: {exc})")
-                        prog.tick(bad=real_lbas)
-                if chunk_write_err:
-                    failed_chunks.add(chunk_idx)
+                # Full-chunk write — size rounded up to 4096 for O_DIRECT,
+                # capped at chunk_bytes.  A few bytes past lba_e may be written
+                # on the last partial chunk; safe on unallocated space.
+                actual_bytes = (lba_e - lba_s + 1) * sector_size
+                write_bytes  = min(chunk_bytes,
+                                   ((actual_bytes + 4095) // 4096) * 4096)
+                write_data   = (rand_tile if is_rand else pat_tmpl)[:write_bytes]
+                byte_off     = lba_s * sector_size
+                try:
+                    os.lseek(fd_w, byte_off, os.SEEK_SET)
+                    t0_w     = time.monotonic()
+                    wbuf.write_from(fd_w, write_data)
+                    write_ms = (time.monotonic() - t0_w) * 1000
+
+                    if write_ms > args.slow_ms:
+                        for sr_s, sr_e in subranges:
+                            new_slow.append((sr_s, sr_e))
+                            if out_f:       out_f.write_range(sr_s, sr_e)
+                            if slow_out_f:  slow_out_f.write_range(sr_s, sr_e)
+                            if log:         log.write(
+                                f"SLOW  LBA {sr_s:,}–{sr_e:,}  {write_ms:.0f} ms (write)")
+                            if args.verbose:
+                                print(f"\n  [SLOW] LBA {sr_s:,}–{sr_e:,}"
+                                      f"  ({write_ms:.0f} ms write)")
+                            prog.tick(slow=sr_e - sr_s + 1)
+
+                except OSError as exc:
+                    if not os.path.exists(args.device):
+                        device_gone[0] = True
+                    else:
+                        for sr_s, sr_e in subranges:
+                            new_bad.append((sr_s, sr_e))
+                            if out_f:  out_f.write_range(sr_s, sr_e)
+                            if log:    log.write(
+                                f"BAD   LBA {sr_s:,}–{sr_e:,}  OSError {pat_name} (write): {exc}")
+                            if args.verbose:
+                                print(f"\n  [BAD]  LBA {sr_s:,}–{sr_e:,}"
+                                      f"  (write error {pat_name}: {exc})")
+                            prog.tick(bad=sr_e - sr_s + 1)
+                        failed_chunks.add(chunk_idx)
                 prog.advance()
 
             if interrupted[0] or device_gone[0]:
@@ -1198,9 +1247,10 @@ def scan(args, skip: IntervalSet):
             _fdatasync(fd_w)
             print(" done")
 
-            # Flush write-phase bad/slow into live skip set so verify phase
-            # (and all following passes) don't re-visit them.
-            _flush_to_skip()
+            # Flush write-phase BAD sectors into live skip set so verify phase
+            # doesn't re-visit them.  Slow sectors are intentionally NOT flushed
+            # here so they still reach the verify phase and can be upgraded to BAD.
+            _flush_to_skip(include_slow=False)
             print()
 
             # ── VERIFY PHASE ───────────────────────────────────────────────────
@@ -1232,7 +1282,12 @@ def scan(args, skip: IntervalSet):
                     real_lbas  = sr_e - sr_s + 1
                     real_bytes = real_lbas * sector_size
                     byte_off   = sr_s * sector_size
-                    expected   = rand_tile[:real_bytes] if is_rand else pat_tmpl[:real_bytes]
+                    # RAND: full chunk was written as one buffer from lba_s,
+                    # so the expected bytes for this sub-range are offset within
+                    # rand_tile.  Deterministic patterns are uniform so [0:n] == [k:k+n].
+                    sr_offset = (sr_s - lba_s) * sector_size
+                    expected  = (rand_tile[sr_offset : sr_offset + real_bytes]
+                                 if is_rand else pat_tmpl[:real_bytes])
 
                     chunk_bad    = False
                     chunk_slow   = False
@@ -1578,6 +1633,11 @@ def main():
 
     if getattr(args, 'streaming', False) and not args.destructive:
         print("[!] --streaming requires --destructive.", file=sys.stderr); sys.exit(1)
+
+    if getattr(args, 'streaming', False) and args.chunk_size % 8 != 0:
+        print(f"[!] --streaming requires --chunk-size to be a multiple of 8 "
+              f"(O_DIRECT needs 4096-byte aligned writes). Got {args.chunk_size}.",
+              file=sys.stderr); sys.exit(1)
 
     if args.rand_passes > 1 and args.passes < 5:
         print("[!] --rand-passes > 1 has no effect unless --passes 5 (RAND included) — ignoring.")
