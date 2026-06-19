@@ -1,10 +1,22 @@
 #!/usr/bin/env python3
 """
-heavybad.py v1.0.7 — Multi-pass bad-sector detector for Linux raw block devices
+heavybad.py v1.0.8 — Multi-pass bad-sector detector for Linux raw block devices
 https://github.com/loverofpizzas/heavybad
 
 Changelog
 ─────────
+v1.0.8
+  Bug fix:
+    - In streaming mode, the post-verify-phase skip flush was outside the
+      pattern pass loop (indentation error), so it only ran once after all
+      passes completed rather than after each individual pass.  Slow sectors
+      found in WRITE pass N were therefore not in the live skip set for WRITE
+      pass N+1 and would be re-flagged.  Flush is now correctly inside the loop.
+  New:
+    - Progress bar shows total elapsed time since scan start as +HH:MM:SS.
+      This counter is never reset between phases, so it accumulates across the
+      full scan regardless of how many write/verify phases have run.
+
 v1.0.7
   Streaming mode — write-phase timing and slow detection:
     - fd_w is now opened with O_DIRECT (no O_SYNC) in streaming mode.
@@ -160,7 +172,7 @@ import subprocess
 import datetime
 from pathlib import Path
 
-VERSION = "1.0.7"
+VERSION = "1.0.8"
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -823,6 +835,7 @@ class Progress:
         self.skip_lbas    = 0
         self.total_reads  = 0
         self.t0           = time.monotonic()
+        self.scan_t0      = time.monotonic()   # never reset; tracks total elapsed
         self._last        = 0.0
         self._temp        = temp_poller
         self._label       = label
@@ -869,6 +882,7 @@ class Progress:
         elapsed = time.monotonic() - self.t0 or 1e-9
         temp    = f"  {self._temp.get()}" if self._temp else ""
         label   = f"[{self._label}] " if self._label else ""
+        total_elapsed = _fmt_eta(time.monotonic() - self.scan_t0)
 
         # ETA: wall-clock rate (includes skipping — gives accurate finish time)
         wall_rate = self.done * self.chunk_bytes / elapsed
@@ -889,7 +903,7 @@ class Progress:
             f"B:{_fmt_lbas(self.bad_lbas)}({self.bad_chunks})  "
             f"Sl:{_fmt_lbas(self.slow_lbas)}({self.slow_chunks})  "
             f"Sk:{_fmt_lbas(self.skip_lbas)}  "
-            f"{rate_mb:5.1f} MB/s  ETA {eta}{temp}  "
+            f"{rate_mb:5.1f} MB/s  ETA {eta}  +{total_elapsed}{temp}  "
         )
         sys.stdout.flush()
 
@@ -1344,10 +1358,10 @@ def scan(args, skip: IntervalSet):
 
                 prog.advance()
 
-        # Flush verify-phase bad/slow into live skip set so the next
-        # pattern pass's write phase skips them from the start.
-        if not (interrupted[0] or device_gone[0]):
-            _flush_to_skip()
+            # Flush verify-phase bad/slow into live skip set so the next
+            # pattern pass's write phase skips them from the start.
+            if not (interrupted[0] or device_gone[0]):
+                _flush_to_skip()
 
     # ── CHUNK mode (default) ─────────────────────────────────────────────────
     # When _streaming is True the range evaluates to range(N, N) = empty,
